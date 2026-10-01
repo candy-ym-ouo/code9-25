@@ -102,8 +102,13 @@ export function mergeTags(sourceId: string, targetId: string, libraryId: string)
 
   const run = db.transaction(() => {
     const bindings = db
-      .prepare('SELECT inspiration_id FROM inspiration_tag WHERE tag_id = ?')
-      .all(sourceId) as { inspiration_id: string }[];
+      .prepare(
+        `SELECT it.inspiration_id
+         FROM inspiration_tag it
+         JOIN inspiration i ON i.id = it.inspiration_id AND i.library_id = ?
+         WHERE it.tag_id = ?`,
+      )
+      .all(libraryId, sourceId) as { inspiration_id: string }[];
     for (const b of bindings) {
       db.prepare(
         `INSERT INTO inspiration_tag (inspiration_id, tag_id, source, created_at) VALUES (?,?, 'bulk', ?)
@@ -112,7 +117,14 @@ export function mergeTags(sourceId: string, targetId: string, libraryId: string)
     }
     db.prepare('DELETE FROM tag WHERE id = ?').run(sourceId);
     const n = (
-      db.prepare('SELECT COUNT(*) AS n FROM inspiration_tag WHERE tag_id = ?').get(targetId) as { n: number }
+      db
+        .prepare(
+          `SELECT COUNT(*) AS n
+           FROM inspiration_tag it
+           JOIN inspiration i ON i.id = it.inspiration_id AND i.library_id = ?
+           WHERE it.tag_id = ?`,
+        )
+        .get(libraryId, targetId) as { n: number }
     ).n;
     db.prepare('UPDATE tag SET usage_count = ? WHERE id = ?').run(n, targetId);
   });
@@ -144,15 +156,19 @@ export function suggestTags(
   }
 
   const placeholders = tagIds.map(() => '?').join(',');
+  // 共现的两端（种子标签 a 与候选标签 t）以及承载共现的灵感都必须属于本库，
+  // 外部库标签或历史遗留的跨库绑定都不能影响本库补全结果。
   const rows = db
     .prepare(
       `SELECT t.id, t.name, t.domain, COUNT(*) AS co
-       FROM inspiration_tag a
-       JOIN inspiration_tag b ON a.inspiration_id = b.inspiration_id
-       JOIN tag t ON t.id = b.tag_id
-       WHERE a.tag_id IN (${placeholders})
-         AND b.tag_id NOT IN (${placeholders})
-         AND t.library_id = ? AND t.disabled = 0
+       FROM inspiration i
+       JOIN inspiration_tag a ON a.inspiration_id = i.id
+       JOIN inspiration_tag b ON b.inspiration_id = i.id
+       JOIN tag at ON at.id = a.tag_id AND at.library_id = i.library_id
+       JOIN tag t ON t.id = b.tag_id AND t.library_id = i.library_id
+       WHERE at.id IN (${placeholders})
+         AND t.id NOT IN (${placeholders})
+         AND i.library_id = ? AND t.disabled = 0
        GROUP BY t.id
        ORDER BY co DESC
        LIMIT ?`,

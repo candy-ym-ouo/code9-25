@@ -15,6 +15,7 @@ let shareToken = '';
 let linkId = '';
 let planId = '';
 let tmpDir = '';
+let getDb: (typeof import('../src/db.js'))['getDb'];
 
 function call(method: 'get' | 'post' | 'put' | 'patch' | 'delete', url: string, body?: unknown) {
   let req = request(app)[method](url);
@@ -35,8 +36,9 @@ beforeAll(async () => {
   process.env.ENABLE_CLIMATE_BASELINE = 'false';
 
   const { createApp } = await import('../src/app.js');
-  const { migrate } = await import('../src/db.js');
+  const { migrate, getDb: getDbFn } = await import('../src/db.js');
   migrate();
+  getDb = getDbFn;
   app = createApp();
 });
 
@@ -414,6 +416,121 @@ describe('E9 离线补录幂等', () => {
     expect(second.status).toBe(200);
     expect(second.body.duplicate).toBe(true);
     expect(second.body.code).toBe('OFFLINE_OP_DUPLICATE');
+  });
+});
+
+describe('E11 跨库标签隔离', () => {
+  let otherToken = '';
+  let otherTagId = '';
+  let ownTagId = '';
+
+  it('准备：注册第二个库，拿到他库标签 id；本库新建一个自定义标签', async () => {
+    const other = await call('post', '/api/auth/register', {
+      email: 'other@test.local',
+      password: 'password123',
+      displayName: '另一个库',
+    });
+    expect(other.status).toBe(201);
+    otherToken = other.body.token;
+
+    const otherTagsRes = await request(app)
+      .get('/api/tags')
+      .set('authorization', `Bearer ${otherToken}`);
+    const otherFlat = (otherTagsRes.body.items as { children?: { id: string; name: string }[] }[]).flatMap(
+      (g) => g.children ?? [],
+    );
+    otherTagId = otherFlat.find((t) => t.name === '逆光')!.id;
+    expect(otherTagId).toBeTruthy();
+
+    const created = await call('post', '/api/tags', { domain: 'light', name: '本库独有光位标签' });
+    expect(created.status).toBe(201);
+    ownTagId = created.body.id;
+
+    const tagRow = getDb().prepare('SELECT usage_count FROM tag WHERE id = ?').get(otherTagId) as {
+      usage_count: number;
+    };
+    expect(tagRow.usage_count).toBe(0);
+  });
+
+  it('直接用他库标签给本库灵感打标 → 403，且不产生绑定、不改对方计数', async () => {
+    const res = await call('post', '/api/inspirations/bulk-tag', {
+      ids: [cardId],
+      addTagIds: [ownTagId, otherTagId],
+    });
+    expect(res.status).toBe(403);
+    expect(res.body.error.code).toBe('LIBRARY_SCOPE_DENIED');
+
+    // 原子拒绝：同批里合法的本库标签也不应被写入
+    const bindings = getDb()
+      .prepare('SELECT tag_id FROM inspiration_tag WHERE inspiration_id = ?')
+      .all(cardId) as { tag_id: string }[];
+    expect(bindings.some((b) => b.tag_id === ownTagId)).toBe(false);
+    expect(bindings.some((b) => b.tag_id === otherTagId)).toBe(false);
+
+    const tagRow = getDb().prepare('SELECT usage_count FROM tag WHERE id = ?').get(otherTagId) as {
+      usage_count: number;
+    };
+    expect(tagRow.usage_count).toBe(0);
+  });
+
+  it('离线补录携带他库标签同样被拒，计数不受影响', async () => {
+    const res = await call('post', '/api/offline/apply', {
+      clientOpId: 'op-cross-lib-tag',
+      opType: 'tag',
+      payload: { inspirationId: cardId, addTagIds: [otherTagId] },
+    });
+    expect([403, 404]).toContain(res.status);
+    const tagRow = getDb().prepare('SELECT usage_count FROM tag WHERE id = ?').get(otherTagId) as {
+      usage_count: number;
+    };
+    expect(tagRow.usage_count).toBe(0);
+  });
+
+  it('解绑一个他库标签 id → 拒绝，不改动对方计数', async () => {
+    const res = await call('post', '/api/inspirations/bulk-tag', {
+      ids: [cardId],
+      removeTagIds: [otherTagId],
+    });
+    expect([403, 404]).toContain(res.status);
+    const tagRow = getDb().prepare('SELECT usage_count FROM tag WHERE id = ?').get(otherTagId) as {
+      usage_count: number;
+    };
+    expect(tagRow.usage_count).toBe(0);
+  });
+
+  it('本库补全建议不受他库标签影响（即便库内存在历史跨库绑定）', async () => {
+    // 让本库这张灵感再带一个本库标签，使共现关系"看起来成立"
+    await call('post', '/api/inspirations/bulk-tag', { ids: [cardId], addTagIds: [ownTagId] });
+    // 手工注入一条历史遗留的跨库绑定（模拟修复前的脏数据）：
+    // 他库标签 otherTagId 与本库标签 ownTagId 共现在本库灵感上。
+    const now = new Date().toISOString();
+    getDb()
+      .prepare('INSERT OR IGNORE INTO inspiration_tag (inspiration_id, tag_id, source, created_at) VALUES (?,?,?,?)')
+      .run(cardId, otherTagId, 'bulk', now);
+
+    // 用他库标签 id 作为种子：旧实现会借这条跨库绑定把本库 ownTagId 顶出来
+    const seededByForeign = await call('get', `/api/tags/suggest?tagIds=${otherTagId}`);
+    expect(seededByForeign.status).toBe(200);
+    const foreignIds = (seededByForeign.body.items as { id: string }[]).map((t) => t.id);
+    expect(foreignIds).not.toContain(ownTagId);
+    expect(foreignIds).not.toContain(otherTagId);
+
+    // 用本库标签作为种子：结果里同样不能混入他库标签
+    const res = await call('get', `/api/tags/suggest?tagIds=${tagIds['逆光']}`);
+    expect(res.status).toBe(200);
+    const ids = (res.body.items as { id: string }[]).map((t) => t.id);
+    expect(ids).not.toContain(otherTagId);
+
+    // 清理注入数据，避免影响后续用例
+    getDb().prepare('DELETE FROM inspiration_tag WHERE inspiration_id = ? AND tag_id = ?').run(cardId, otherTagId);
+  });
+
+  it('不存在的标签 id → 404，而不是 500', async () => {
+    const res = await call('post', '/api/inspirations/bulk-tag', {
+      ids: [cardId],
+      addTagIds: ['c_does_not_exist_tag_id'],
+    });
+    expect(res.status).toBe(404);
   });
 });
 

@@ -109,12 +109,30 @@ export function addTags(
   const db = getDb();
   const ts = nowIso();
   let added = 0;
+
+  // 跨库写入必须在事务外、写入前整体拒绝：灵感与标签必须属于同一个资料库，
+  // 否则既会产生跨库绑定，又会改动对方库标签的 usage_count。
+  const inspiration = db.prepare('SELECT library_id FROM inspiration WHERE id = ?').get(inspirationId) as
+    | { library_id: string }
+    | undefined;
+  if (!inspiration) throw errors.notFound('灵感卡');
+
+  const uniqueTagIds = [...new Set(tagIds)];
+  if (uniqueTagIds.length) {
+    const placeholders = uniqueTagIds.map(() => '?').join(',');
+    const tags = db
+      .prepare(`SELECT id, library_id FROM tag WHERE id IN (${placeholders})`)
+      .all(...uniqueTagIds) as { id: string; library_id: string }[];
+    if (tags.length !== uniqueTagIds.length) throw errors.notFound('标签');
+    if (tags.some((t) => t.library_id !== inspiration.library_id)) throw errors.scopeDenied();
+  }
+
   const stmt = db.prepare(
     `INSERT INTO inspiration_tag (inspiration_id, tag_id, source, created_at) VALUES (?,?,?,?)
      ON CONFLICT (inspiration_id, tag_id) DO NOTHING`,
   );
   const run = db.transaction(() => {
-    for (const tagId of tagIds) {
+    for (const tagId of uniqueTagIds) {
       const res = stmt.run(inspirationId, tagId, source, ts);
       if (res.changes > 0) {
         added += 1;
@@ -134,8 +152,24 @@ export function addTags(
 export function removeTags(inspirationId: string, tagIds: string[]): number {
   const db = getDb();
   let removed = 0;
+
+  const uniqueTagIds = [...new Set(tagIds)];
+  if (uniqueTagIds.length) {
+    const inspiration = db.prepare('SELECT library_id FROM inspiration WHERE id = ?').get(inspirationId) as
+      | { library_id: string }
+      | undefined;
+    if (!inspiration) throw errors.notFound('灵感卡');
+    const placeholders = uniqueTagIds.map(() => '?').join(',');
+    const tags = db
+      .prepare(`SELECT id, library_id FROM tag WHERE id IN (${placeholders})`)
+      .all(...uniqueTagIds) as { id: string; library_id: string }[];
+    if (tags.length !== uniqueTagIds.length) throw errors.notFound('标签');
+    // 跨库解绑同样拒绝：不能借删除动作改动对方库标签的计数。
+    if (tags.some((t) => t.library_id !== inspiration.library_id)) throw errors.scopeDenied();
+  }
+
   const run = db.transaction(() => {
-    for (const tagId of tagIds) {
+    for (const tagId of uniqueTagIds) {
       const res = db
         .prepare('DELETE FROM inspiration_tag WHERE inspiration_id = ? AND tag_id = ?')
         .run(inspirationId, tagId);
