@@ -114,7 +114,10 @@ export function scoreCandidates(
     const reasons: string[] = [];
     const tags = db
       .prepare(
-        'SELECT t.id, t.name FROM inspiration_tag it JOIN tag t ON t.id = it.tag_id WHERE it.inspiration_id = ?',
+        `SELECT t.id, t.name FROM inspiration_tag it
+         JOIN tag t ON t.id = it.tag_id
+         JOIN inspiration i ON i.id = it.inspiration_id AND i.library_id = t.library_id
+         WHERE it.inspiration_id = ?`,
       )
       .all(id) as { id: string; name: string }[];
     const tagIds = new Set(tags.map((t) => t.id));
@@ -440,7 +443,10 @@ export function publishAlbum(
       | undefined;
     const tags = db
       .prepare(
-        'SELECT t.domain, t.name FROM inspiration_tag it JOIN tag t ON t.id = it.tag_id WHERE it.inspiration_id = ?',
+        `SELECT t.domain, t.name FROM inspiration_tag it
+         JOIN tag t ON t.id = it.tag_id
+         JOIN inspiration i ON i.id = it.inspiration_id AND i.library_id = t.library_id
+         WHERE it.inspiration_id = ?`,
       )
       .all(item.inspiration_id) as { domain: string; name: string }[];
     const assets = db

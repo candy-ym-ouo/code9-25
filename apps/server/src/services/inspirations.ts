@@ -28,8 +28,12 @@ export function touch(id: string): void {
 
 export function tagCountOf(inspirationId: string): number {
   const r = getDb()
-    .prepare('SELECT COUNT(*) AS n FROM inspiration_tag WHERE inspiration_id = ?')
-    .get(inspirationId) as { n: number };
+    .prepare(
+      `SELECT COUNT(*) AS n
+       FROM inspiration_tag it JOIN tag t ON t.id = it.tag_id
+       WHERE it.inspiration_id = ? AND t.library_id = (SELECT library_id FROM inspiration WHERE id = ?)`,
+    )
+    .get(inspirationId, inspirationId) as { n: number };
   return r.n;
 }
 
@@ -101,11 +105,36 @@ export function createInspiration(params: {
   return id;
 }
 
+/**
+ * 跨库写入硬边界：解析灵感卡并校验所有标签归属同一资料库。
+ * - 灵感卡不存在 → NOT_FOUND
+ * - 标签不存在或属于别的库 → LIBRARY_SCOPE_DENIED（跨库写入必须整体拒绝，绝不部分写入）
+ */
+function resolveBindingScope(inspirationId: string, tagIds: string[]): { libraryId: string } {
+  const db = getDb();
+  const row = db
+    .prepare('SELECT library_id FROM inspiration WHERE id = ? AND deleted_at IS NULL')
+    .get(inspirationId) as { library_id: string } | undefined;
+  if (!row) throw errors.notFound('灵感卡');
+
+  if (tagIds.length) {
+    const placeholders = tagIds.map(() => '?').join(',');
+    const owned = (
+      db
+        .prepare(`SELECT COUNT(*) AS n FROM tag WHERE id IN (${placeholders}) AND library_id = ?`)
+        .get(...tagIds, row.library_id) as { n: number }
+    ).n;
+    if (owned !== new Set(tagIds).size) throw errors.scopeDenied();
+  }
+  return { libraryId: row.library_id };
+}
+
 export function addTags(
   inspirationId: string,
   tagIds: string[],
   source: 'manual' | 'bulk' | 'album_gap' | 'suggested' = 'manual',
 ): number {
+  resolveBindingScope(inspirationId, tagIds);
   const db = getDb();
   const ts = nowIso();
   let added = 0;
@@ -132,6 +161,7 @@ export function addTags(
 }
 
 export function removeTags(inspirationId: string, tagIds: string[]): number {
+  resolveBindingScope(inspirationId, tagIds);
   const db = getDb();
   let removed = 0;
   const run = db.transaction(() => {
@@ -177,11 +207,20 @@ export function dropInspiration(id: string, reason: string): void {
 export function mergeInspirations(keepId: string, mergeIds: string[], reason = 'merged'): void {
   const db = getDb();
   const run = db.transaction(() => {
+    const keepRow = db
+      .prepare('SELECT library_id FROM inspiration WHERE id = ? AND deleted_at IS NULL')
+      .get(keepId) as { library_id: string } | undefined;
+    if (!keepRow) throw errors.notFound('灵感卡');
     for (const mergeId of mergeIds) {
       if (mergeId === keepId) continue;
+      // 只搬运同库标签；历史遗留的跨库绑定不得随合并扩散（删除来源卡后由外键级联清掉）
       const tags = db
-        .prepare('SELECT tag_id FROM inspiration_tag WHERE inspiration_id = ?')
-        .all(mergeId) as { tag_id: string }[];
+        .prepare(
+          `SELECT it.tag_id AS tag_id FROM inspiration_tag it
+           JOIN tag t ON t.id = it.tag_id
+           WHERE it.inspiration_id = ? AND t.library_id = ?`,
+        )
+        .all(mergeId, keepRow.library_id) as { tag_id: string }[];
       for (const t of tags) {
         db.prepare(
           `INSERT INTO inspiration_tag (inspiration_id, tag_id, source, created_at) VALUES (?,?, 'bulk', ?)
@@ -206,8 +245,10 @@ export function mergeInspirations(keepId: string, mergeIds: string[], reason = '
 /** 维护 FTS 索引（检索用，文档 15.1） */
 export function reindexFts(inspirationId: string): void {
   const db = getDb();
-  const row = db.prepare('SELECT id, title, note, spot_id FROM inspiration WHERE id = ?').get(inspirationId) as
-    | { id: string; title: string; note: string | null; spot_id: string | null }
+  const row = db
+    .prepare('SELECT id, title, note, spot_id, library_id FROM inspiration WHERE id = ?')
+    .get(inspirationId) as
+    | { id: string; title: string; note: string | null; spot_id: string | null; library_id: string }
     | undefined;
   db.prepare('DELETE FROM inspiration_fts WHERE inspiration_id = ?').run(inspirationId);
   if (!row) return;
@@ -234,9 +275,11 @@ export function reindexFts(inspirationId: string): void {
   }
   const tags = db
     .prepare(
-      'SELECT t.name FROM inspiration_tag it JOIN tag t ON t.id = it.tag_id WHERE it.inspiration_id = ?',
+      `SELECT t.name FROM inspiration_tag it
+       JOIN tag t ON t.id = it.tag_id
+       WHERE it.inspiration_id = ? AND t.library_id = ?`,
     )
-    .all(inspirationId) as { name: string }[];
+    .all(inspirationId, row.library_id) as { name: string }[];
 
   db.prepare('INSERT INTO inspiration_fts (inspiration_id, title, note, place, tags) VALUES (?,?,?,?,?)').run(
     inspirationId,

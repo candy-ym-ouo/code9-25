@@ -153,10 +153,10 @@ export function toInspirationDto(
     .prepare(
       `SELECT t.id, t.domain, t.name, t.slug, it.source
        FROM inspiration_tag it JOIN tag t ON t.id = it.tag_id
-       WHERE it.inspiration_id = ?
+       WHERE it.inspiration_id = ? AND t.library_id = ?
        ORDER BY t.domain, t.sort_order`,
     )
-    .all(row.id) as { id: string; domain: TagDomain; name: string; slug: string; source: TagSource }[];
+    .all(row.id, row.library_id) as { id: string; domain: TagDomain; name: string; slug: string; source: TagSource }[];
 
   const assetRows = db
     .prepare('SELECT * FROM asset WHERE inspiration_id = ? ORDER BY created_at ASC')
